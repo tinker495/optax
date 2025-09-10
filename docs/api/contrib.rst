@@ -36,6 +36,8 @@ are not supported by the main library.
     MuonState
     normuon
     NorMuonState
+    norprism
+    NorPrismState
     prodigy
     ProdigyState
     sam
@@ -134,6 +136,12 @@ NorMuon
 .. autofunction:: normuon
 .. autofunction:: scale_by_normuon
 .. autoclass:: NorMuonState
+
+NorPrism
+~~~~~~~~
+.. autofunction:: norprism
+.. autofunction:: scale_by_norprism
+.. autoclass:: NorPrismState
 
 Prodigy
 ~~~~~~~

@@ -57,6 +57,9 @@ from optax.contrib._muon import scale_by_muon
 from optax.contrib._normuon import normuon
 from optax.contrib._normuon import NorMuonState
 from optax.contrib._normuon import scale_by_normuon
+from optax.contrib._norprism import norprism
+from optax.contrib._norprism import NorPrismState
+from optax.contrib._norprism import scale_by_norprism
 from optax.contrib._privacy import differentially_private_aggregate
 from optax.contrib._privacy import DifferentiallyPrivateAggregateState
 from optax.contrib._privacy import dpsgd
