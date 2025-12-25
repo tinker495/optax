@@ -28,6 +28,7 @@ from optax._src import factorized
 from optax._src import linesearch as _linesearch
 from optax._src import transform
 from optax._src import wrappers
+from optax.contrib._cwd import add_cautious_weight_decay
 from optax.transforms import _clipping
 
 MaskOrFn = Optional[Union[Any, Callable[[base.Params], Any]]]
@@ -604,6 +605,7 @@ def adamw(
     mu_dtype: Optional[Any] = None,
     weight_decay: base.ScalarOrSchedule = 1e-4,
     mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None,
+    cautious_weight_decay: bool = False,
     *,
     nesterov: bool = False,
 ) -> base.GradientTransformationExtraArgs:
@@ -722,7 +724,11 @@ def adamw(
           mu_dtype=mu_dtype,
           nesterov=nesterov,
       ),
-      transform.add_decayed_weights(weight_decay, mask),
+      (
+          add_cautious_weight_decay(weight_decay, mask)
+          if cautious_weight_decay
+          else transform.add_decayed_weights(weight_decay, mask)
+      ),
       transform.scale_by_learning_rate(learning_rate),
   )
 

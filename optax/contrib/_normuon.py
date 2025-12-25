@@ -37,6 +37,7 @@ from optax._src import utils
 from optax.contrib import _muon
 from optax.transforms import _masking
 import optax.tree
+from optax.contrib import add_cautious_weight_decay
 
 MuonDimensionNumbers = _muon.MuonDimensionNumbers
 WeightDimNumOrFn = _muon.WeightDimNumOrFn
@@ -256,6 +257,7 @@ def normuon(
     weight_decay_mask: Optional[
         Union[Any, Callable[[base.Params], Any]]
     ] = None,
+    cautious_weight_decay: bool = False,
     mu_dtype: Optional[chex.ArrayDType] = None,
     v_dtype: Optional[chex.ArrayDType] = None,
     *,
@@ -362,7 +364,13 @@ def normuon(
                   v_dtype=v_dtype,
                   weight_dimension_numbers=normuon_weight_dim_nums_fn,
               ),
-              transform.add_decayed_weights(weight_decay, weight_decay_mask),
+              (
+                  add_cautious_weight_decay(weight_decay, weight_decay_mask)
+                  if cautious_weight_decay
+                  else transform.add_decayed_weights(
+                      weight_decay, weight_decay_mask
+                  )
+              ),
               transform.scale_by_learning_rate(learning_rate),
           ),
           'adam': alias.adamw(
@@ -372,6 +380,7 @@ def normuon(
               eps=eps,
               eps_root=adam_eps_root,
               weight_decay=adam_weight_decay,
+              cautious_weight_decay=cautious_weight_decay,
               mu_dtype=mu_dtype,
           ),
       },
