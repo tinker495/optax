@@ -33,6 +33,7 @@ from optax._src import combine
 from optax._src import numerics
 from optax._src import transform
 from optax._src import utils
+from optax.contrib._cwd import add_cautious_weight_decay
 from optax.transforms import _masking
 import optax.tree
 
@@ -396,6 +397,7 @@ def muon(
     weight_decay_mask: Optional[
         Union[Any, Callable[[base.Params], Any]]
     ] = None,
+    cautious_weight_decay: bool = False,
     mu_dtype: Optional[jax.typing.DTypeLike] = None,
     *,
     nesterov: bool = True,
@@ -521,7 +523,13 @@ def muon(
                   weight_dimension_numbers=muon_weight_dim_nums_fn,
                   consistent_rms=consistent_rms,
               ),
-              transform.add_decayed_weights(weight_decay, weight_decay_mask),
+              (
+                  add_cautious_weight_decay(weight_decay, weight_decay_mask)
+                  if cautious_weight_decay
+                  else transform.add_decayed_weights(
+                      weight_decay, weight_decay_mask
+                  )
+              ),
               transform.scale_by_learning_rate(learning_rate),
           ),
           'adam': alias.adamw(
@@ -531,6 +539,7 @@ def muon(
               eps=eps,
               eps_root=adam_eps_root,
               weight_decay=adam_weight_decay,
+              cautious_weight_decay=cautious_weight_decay,
               mu_dtype=mu_dtype,
               nesterov=nesterov,
           ),
