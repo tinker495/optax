@@ -8,6 +8,8 @@ are not supported by the main library.
 
 .. autosummary::
     acprop
+    adago
+    AdaGOState
     ademamix
     adopt
     ano
@@ -113,6 +115,12 @@ Momo
 .. autoclass:: MomoState
 .. autofunction:: momo_adam
 .. autoclass:: MomoAdamState
+
+AdaGO
+~~~~~
+.. autofunction:: adago
+.. autofunction:: scale_by_adago
+.. autoclass:: AdaGOState
 
 Muon
 ~~~~
