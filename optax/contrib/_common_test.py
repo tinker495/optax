@@ -74,7 +74,7 @@ for optimizer in _MAIN_OPTIMIZERS_UNDER_TEST:
 _MAIN_OPTIMIZERS_UNDER_TEST += [
     {
         'opt_name': 'sgd',
-        'opt_kwargs': {'learning_rate': 1e-1},
+        'opt_kwargs': {'learning_rate': 1e-3},
         'wrapper_name': 'add_cautious_weight_decay',
         'wrapper_kwargs': {'weight_decay': 1e-2},
     },
@@ -349,10 +349,10 @@ class ContribTest(parameterized.TestCase):
     elif wrapper_name == 'add_cautious_weight_decay':
       base_opt = _get_opt_factory(opt_name)(**opt_kwargs)
 
-      def factory(**kwargs):
+      def factory(weight_decay):
         return combine.chain(
-          contrib.add_cautious_weight_decay(**kwargs),
-          base_opt,
+            contrib.add_cautious_weight_decay(weight_decay=weight_decay),
+            base_opt,
         )
 
       hparams = wrapper_kwargs
