@@ -256,6 +256,12 @@ class MuonTest(parameterized.TestCase):
     self.assertIsInstance(get_muon_mu(state)["w2"]["a"], _masking.MaskedNode)
     self.assertIsInstance(get_muon_mu(state)["w2"]["b"], _masking.MaskedNode)
 
+  def test_default_partitions_non_2d_to_adam(self):
+    params = {"w": jnp.ones((10, 10)), "b": jnp.ones((10,))}
+    updates, _ = get_updates(params)
+    self.assertEqual(updates["w"].shape, params["w"].shape)
+    self.assertEqual(updates["b"].shape, params["b"].shape)
+
   def test_newton_schulz(self):
     """Test that Newton--Schulz orhogonalizes/unitiarizes correctly."""
     mat_real = jax.random.normal(jax.random.key(0), (4, 3), dtype=jnp.float32)

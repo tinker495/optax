@@ -43,6 +43,8 @@ WeightDimNumOrFn = _muon.WeightDimNumOrFn
 
 
 _is_weight_dim_nums = lambda x: isinstance(x, MuonDimensionNumbers)
+_is_masked_node = lambda x: isinstance(x, _masking.MaskedNode)
+_DEFAULT_NS_COEFFS = (3.4445, -4.7750, 2.0315)
 
 
 def _v_shape(x: jax.Array, dim_nums: MuonDimensionNumbers) -> tuple[int, int]:
@@ -102,15 +104,19 @@ def scale_by_normuon(
     ns_coeffs: Union[
         tuple[float, float, float],
         tuple[tuple[float, float, float], ...],
-    ] = (3.4445, -4.7750, 2.0315),
-    ns_steps: int = 5,
-    b1: float = 0.95,
-    b2: float = 0.95,
-    eps: float = 1e-8,
-    rms_scale: float = 0.2,
-    mu_dtype: Optional[chex.ArrayDType] = None,
-    v_dtype: Optional[chex.ArrayDType] = None,
+    ] = _DEFAULT_NS_COEFFS,
+    ns_steps: jax.typing.ArrayLike = 5,
+    b1: jax.typing.ArrayLike = 0.95,
+    b2: jax.typing.ArrayLike = 0.95,
+    eps: jax.typing.ArrayLike = 1e-8,
+    rms_scale: jax.typing.ArrayLike = 0.2,
+    mu_dtype: Optional[jax.typing.DTypeLike] = None,
+    v_dtype: Optional[jax.typing.DTypeLike] = None,
     *,
+    matmul_precision: jax.lax.Precision | None = None,
+    use_lax_map: bool | None = None,
+    remat_orthogonalize: bool = False,
+    ns_unroll_threshold: int = _muon._NS_UNROLL_THRESHOLD,  # pylint: disable=protected-access
     weight_dimension_numbers: WeightDimNumOrFn | None = None,
 ) -> base.GradientTransformation:
   r"""Rescale updates according to the NorMuon algorithm.
@@ -135,6 +141,13 @@ def scale_by_normuon(
     rms_scale: Target RMS of each orthogonalized-and-normalized update matrix.
     mu_dtype: Data type of the momentum accumulator.
     v_dtype: Data type of the neuron-wise second moment accumulator.
+    matmul_precision: Optional matmul precision for Newton-Schulz.
+    use_lax_map: Whether to use `jax.lax.map` for batch orthogonalization. If
+      `None`, uses a heuristic based on batch and matrix size.
+    remat_orthogonalize: Whether to checkpoint orthogonalization to reduce
+      memory usage when using `jax.vmap`.
+    ns_unroll_threshold: When `ns_coeffs` is 2D, unroll with `fori_loop` when
+      the number of steps is small.
     weight_dimension_numbers: An optional tree with the same structure as the
       params, specifying how to reshape tensors before/after orthogonalization.
       A callable may be provided to generate this tree from params/updates.
@@ -146,18 +159,26 @@ def scale_by_normuon(
   mu_dtype = utils.canonicalize_dtype(mu_dtype)
   v_dtype = jnp.float32 if v_dtype is None else v_dtype
   v_dtype = utils.canonicalize_dtype(v_dtype)
+  ns_coeffs_arr = jnp.asarray(ns_coeffs)
+  if ns_coeffs_arr.ndim > 2 or ns_coeffs_arr.shape[-1] != 3:
+    raise ValueError(
+        f'ns_coeffs must have shape (3,) or (n, 3), got {ns_coeffs_arr.shape}'
+    )
+  ns_steps_ = None
+  if ns_coeffs_arr.ndim == 1:
+    ns_steps_ = _muon._require_static_int(  # pylint: disable=protected-access
+        ns_steps, 'ns_steps'
+    )
+
+  is_leaf = lambda x: x is None or _is_weight_dim_nums(x) or _is_masked_node(x)
 
   def init_fn(params):
     mu = optax.tree.zeros_like(params, dtype=mu_dtype)
-    ns_coeffs_ = jnp.asarray(ns_coeffs)
-    if ns_coeffs_.ndim > 2 or ns_coeffs_.shape[-1] != 3:
-      raise ValueError(
-          f'ns_coeffs must have shape (3,) or (n, 3), got {ns_coeffs_.shape}'
-      )
-
     resolved_dim_nums = _resolve_dim_nums(params, weight_dimension_numbers)
 
     def _init_v_leaf(p: jax.Array, dim_num: MuonDimensionNumbers | None):
+      if _is_masked_node(p) or _is_masked_node(dim_num):
+        return _masking.MaskedNode()
       if dim_num is None:
         if p.ndim != 2:
           raise ValueError(
@@ -169,26 +190,41 @@ def scale_by_normuon(
       return jnp.zeros((batch_size, output_size), dtype=v_dtype)
 
     v = jax.tree.map(
-        _init_v_leaf, params, resolved_dim_nums, is_leaf=_is_weight_dim_nums
+        _init_v_leaf, params, resolved_dim_nums, is_leaf=is_leaf
     )
 
-    return NorMuonState(mu=mu, v=v, ns_coeffs=ns_coeffs_)
+    return NorMuonState(mu=mu, v=v, ns_coeffs=ns_coeffs_arr)
 
   def update_fn(updates, state, params=None):
     del params
     resolved_dim_nums = _resolve_dim_nums(updates, weight_dimension_numbers)
 
-    mu = optax.tree.update_moment(updates, state.mu, b1, 1)
+    def _update_moment(g, m):
+      if g is None or _is_masked_node(g):
+        return g
+      return (1 - b1) * g + b1 * m
+
+    mu = jax.tree.map(_update_moment, updates, state.mu,
+                      is_leaf=lambda x: x is None or _is_masked_node(x))
 
     # Muon orthogonalization.
-    ortho = jax.tree.map(
-        lambda x, dim_num: _muon.orthogonalize_via_newton_schulz(
-            x, state.ns_coeffs, ns_steps, eps, dim_num
-        ),
-        mu,
-        resolved_dim_nums,
-        is_leaf=_is_weight_dim_nums,
-    )
+    def _orthogonalize_leaf(x, dim_num):
+      if _is_masked_node(x) or _is_masked_node(dim_num):
+        return x
+      return _muon.orthogonalize_via_newton_schulz(
+          x,
+          state.ns_coeffs,
+          ns_steps_,
+          eps,
+          dim_num,
+          matmul_precision,
+          use_lax_map,
+          remat_orthogonalize,
+          ns_unroll_threshold,
+      )
+
+    ortho = jax.tree.map(_orthogonalize_leaf, mu, resolved_dim_nums,
+                         is_leaf=is_leaf)
 
     # NorMuon neuron-wise normalization + per-matrix RMS scaling.
     def _normalize_leaf(
@@ -196,6 +232,8 @@ def scale_by_normuon(
         v: jax.Array,
         dim_num: MuonDimensionNumbers | None,
     ):
+      if _is_masked_node(o) or _is_masked_node(dim_num):
+        return _NormuonUpdateAndV(o, v)
       if dim_num is None:
         if o.ndim != 2:
           raise ValueError(
@@ -224,7 +262,7 @@ def scale_by_normuon(
         ortho,
         state.v,
         resolved_dim_nums,
-        is_leaf=_is_weight_dim_nums,
+        is_leaf=is_leaf,
     )
     _is_update_and_v = lambda x: isinstance(x, _NormuonUpdateAndV)
     updates = jax.tree.map(
@@ -246,23 +284,27 @@ def normuon(
     ns_coeffs: Union[
         tuple[float, float, float],
         tuple[tuple[float, float, float], ...],
-    ] = (3.4445, -4.7750, 2.0315),
-    ns_steps: int = 5,
-    b1: float = 0.95,
-    b2: float = 0.95,
-    eps: float = 1e-8,
-    rms_scale: float = 0.2,
-    weight_decay: float = 0.0,
+    ] = _DEFAULT_NS_COEFFS,
+    ns_steps: jax.typing.ArrayLike = 5,
+    b1: jax.typing.ArrayLike = 0.95,
+    b2: jax.typing.ArrayLike = 0.95,
+    eps: jax.typing.ArrayLike = 1e-8,
+    rms_scale: jax.typing.ArrayLike = 0.2,
+    weight_decay: jax.typing.ArrayLike = 0.0,
     weight_decay_mask: Optional[
         Union[Any, Callable[[base.Params], Any]]
     ] = None,
-    mu_dtype: Optional[chex.ArrayDType] = None,
-    v_dtype: Optional[chex.ArrayDType] = None,
+    mu_dtype: Optional[jax.typing.DTypeLike] = None,
+    v_dtype: Optional[jax.typing.DTypeLike] = None,
     *,
-    adam_b1: float = 0.9,
-    adam_b2: float = 0.999,
-    adam_eps_root: float = 0.0,
-    adam_weight_decay: float = 0.0,
+    matmul_precision: jax.lax.Precision | None = None,
+    use_lax_map: bool | None = None,
+    remat_orthogonalize: bool = False,
+    ns_unroll_threshold: int = _muon._NS_UNROLL_THRESHOLD,  # pylint: disable=protected-access
+    adam_b1: jax.typing.ArrayLike = 0.9,
+    adam_b2: jax.typing.ArrayLike = 0.999,
+    adam_eps_root: jax.typing.ArrayLike = 0.0,
+    adam_weight_decay: jax.typing.ArrayLike = 0.0,
     normuon_weight_dimension_numbers: WeightDimNumOrFn | None = None,
 ) -> base.GradientTransformation:
   r"""NorMuon: Neuron-wise Normalized Muon.
@@ -291,6 +333,13 @@ def normuon(
       apply the weight decay to, and `False` for those you want to skip.
     mu_dtype: Data type of the first moment accumulator.
     v_dtype: Data type of the neuron-wise second moment accumulator.
+    matmul_precision: Optional matmul precision for Newton-Schulz.
+    use_lax_map: Whether to use `jax.lax.map` for batch orthogonalization. If
+      `None`, uses a heuristic based on batch and matrix size.
+    remat_orthogonalize: Whether to checkpoint orthogonalization to reduce
+      memory usage when using `jax.vmap`.
+    ns_unroll_threshold: When `ns_coeffs` is 2D, unroll with `fori_loop` when
+      the number of steps is small.
     adam_b1: Exponential decay rate for Adam's first moment estimates.
     adam_b2: Exponential decay rate for Adam's second moment estimates.
     adam_eps_root: Epsilon to stabilize division in Adam, square root version.
@@ -331,22 +380,46 @@ def normuon(
           is_leaf=lambda x: x is None or _is_weight_dim_nums(x),
       )
 
+  dim_nums_cache: dict[tuple[jax.tree_util.PyTreeDef, tuple], base.PyTree] = {}
+  label_cache: dict[tuple[jax.tree_util.PyTreeDef, tuple], base.PyTree] = {}
+  mask_cache: dict[tuple[jax.tree_util.PyTreeDef, tuple], base.PyTree] = {}
+
   def normuon_weight_dim_nums_fn(params):
+    cache_key = None
+    if not _muon._contains_tracer(params):  # pylint: disable=protected-access
+      cache_key = _muon._shape_signature(params)  # pylint: disable=protected-access
+      cached = dim_nums_cache.get(cache_key)
+      if cached is not None:
+        return cached
+
     dim_nums = (
         normuon_weight_dimension_numbers(params)
         if callable(normuon_weight_dimension_numbers)
         else normuon_weight_dimension_numbers
     )
-    mask = jax.tree.map(lambda label: label == 'normuon', param_labels(params))
+    labels = None
+    mask = None
+    if cache_key is not None:
+      labels = label_cache.get(cache_key)
+      mask = mask_cache.get(cache_key)
+    if labels is None:
+      labels = param_labels(params)
+      if cache_key is not None:
+        label_cache[cache_key] = labels
+    if mask is None:
+      mask = jax.tree.map(lambda label: label == 'normuon', labels)
+      if cache_key is not None:
+        mask_cache[cache_key] = mask
     is_leaf = lambda x: (
-        x is None
-        or _is_weight_dim_nums(x)
-        or isinstance(x, _masking.MaskedNode)
+        x is None or _is_weight_dim_nums(x) or _is_masked_node(x)
     )
     populate_subtree_ = lambda dim_num, submask: jax.tree.map(
         lambda m: dim_num if m else _masking.MaskedNode(), submask
     )
-    return jax.tree.map(populate_subtree_, dim_nums, mask, is_leaf=is_leaf)
+    resolved = jax.tree.map(populate_subtree_, dim_nums, mask, is_leaf=is_leaf)
+    if cache_key is not None:
+      dim_nums_cache[cache_key] = resolved
+    return resolved
 
   return combine.partition(
       transforms={
@@ -360,6 +433,10 @@ def normuon(
                   rms_scale=rms_scale,
                   mu_dtype=mu_dtype,
                   v_dtype=v_dtype,
+                  matmul_precision=matmul_precision,
+                  use_lax_map=use_lax_map,
+                  remat_orthogonalize=remat_orthogonalize,
+                  ns_unroll_threshold=ns_unroll_threshold,
                   weight_dimension_numbers=normuon_weight_dim_nums_fn,
               ),
               transform.add_decayed_weights(weight_decay, weight_decay_mask),

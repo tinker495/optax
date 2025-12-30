@@ -22,6 +22,7 @@ import jax.numpy as jnp
 
 from optax.contrib import _muon
 from optax.contrib import _normuon
+from optax.transforms import _masking
 
 UNSPECIFIED = object()
 
@@ -101,6 +102,30 @@ class NorMuonTest(chex.TestCase):
     state = opt.init(params)
     updates, _ = opt.update(params, state, params=params)
     self.assertEqual(jax.tree.structure(updates), jax.tree.structure(params))
+
+  def test_dim_nums_combinations(self):
+    get_state = lambda s: s.inner_states["normuon"].inner_state[0]
+    dim_num = _muon.MuonDimensionNumbers(reduction_axis=(1,), output_axis=(2,))
+
+    params = {"w1": jnp.ones((1, 2, 3)), "w2": jnp.ones((2, 3, 4))}
+    dim_nums = {"w1": None, "w2": dim_num}
+    _, state = get_updates(params, dim_nums)
+    normuon_state = get_state(state)
+    self.assertIsInstance(normuon_state.mu["w1"], _masking.MaskedNode)
+    self.assertIsInstance(normuon_state.v["w1"], _masking.MaskedNode)
+    self.assertNotIsInstance(normuon_state.mu["w2"], _masking.MaskedNode)
+    self.assertNotIsInstance(normuon_state.v["w2"], _masking.MaskedNode)
+
+  def test_auto_lax_map_heuristic_matches_explicit(self):
+    key = jax.random.key(0)
+    params = {"w": jax.random.normal(key, (4, 3))}
+    tx_auto = _normuon.scale_by_normuon(use_lax_map=None)
+    tx_vmap = _normuon.scale_by_normuon(use_lax_map=False)
+    state_auto = tx_auto.init(params)
+    state_vmap = tx_vmap.init(params)
+    out_auto, _ = tx_auto.update(params, state_auto)
+    out_vmap, _ = tx_vmap.update(params, state_vmap)
+    chex.assert_trees_all_close(out_auto, out_vmap, rtol=1e-6, atol=1e-6)
 
 
 if __name__ == "__main__":
