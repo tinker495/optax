@@ -56,7 +56,7 @@ _MAIN_OPTIMIZERS_UNDER_TEST = [
     {'opt_name': 'adago', 'opt_kwargs': {'learning_rate': 0.02}},
     {
         'opt_name': 'adago',
-        'opt_kwargs': {'learning_rate': 0.02, 'use_normuon': True},
+        'opt_kwargs': {'learning_rate': 0.1, 'use_normuon': True},
     },
     {'opt_name': 'prodigy', 'opt_kwargs': {'learning_rate': 1e-1}},
     {
