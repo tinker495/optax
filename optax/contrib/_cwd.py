@@ -74,7 +74,8 @@ def add_cautious_weight_decay(
       if u is None:
         return None
       # Cautious Weight Decay: only decay if signs align (u * p >= 0)
-      mask_align = (u * p) >= 0
+      # We use sign(u) * sign(p) >= 0 to avoid potential overflow in u * p
+      mask_align = jnp.sign(u) * jnp.sign(p) >= 0
       return u + s * mask_align * p
 
     updates = jax.tree.map(
