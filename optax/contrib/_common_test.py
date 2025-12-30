@@ -349,6 +349,16 @@ class ContribTest(parameterized.TestCase):
     if wrapper_name is None:
       factory = _get_opt_factory(opt_name)
       hparams = opt_kwargs
+    elif wrapper_name == 'add_cautious_weight_decay':
+      base_opt = _get_opt_factory(opt_name)(**opt_kwargs)
+
+      def factory(**kwargs):
+        return combine.chain(
+          contrib.add_cautious_weight_decay(**kwargs),
+          base_opt,
+        )
+
+      hparams = wrapper_kwargs
     else:
       base_opt = _get_opt_factory(opt_name)(**opt_kwargs)
       factory = getattr(contrib, wrapper_name)
