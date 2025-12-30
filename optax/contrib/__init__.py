@@ -18,6 +18,9 @@
 
 from optax.contrib._acprop import acprop
 from optax.contrib._acprop import scale_by_acprop
+from optax.contrib._adago import adago
+from optax.contrib._adago import AdaGOState
+from optax.contrib._adago import scale_by_adago
 from optax.contrib._ademamix import ademamix
 from optax.contrib._ademamix import scale_by_ademamix
 from optax.contrib._ademamix import scale_by_simplified_ademamix
