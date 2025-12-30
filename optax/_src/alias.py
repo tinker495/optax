@@ -1033,6 +1033,8 @@ def amsgrad(
     eps: jax.typing.ArrayLike = 1e-8,
     eps_root: jax.typing.ArrayLike = 0.0,
     mu_dtype: Optional[Any] = None,
+    bias_correction_mu: bool = True,
+    bias_correction_nu: bool = True,
 ) -> base.GradientTransformationExtraArgs:
   """The AMSGrad optimizer.
 
@@ -1051,6 +1053,11 @@ def amsgrad(
       instance when computing (meta-)gradients through Adam.
     mu_dtype: Optional `dtype` to be used for the first order accumulator; if
       `None` then the `dtype` is inferred from `params` and `updates`.
+    bias_correction_mu: Whether to apply bias correction to the first moment
+      estimate. Set to ``False`` to match the original AMSGrad paper.
+    bias_correction_nu: Whether to apply bias correction to the second moment
+      estimate before taking the elementwise maximum (``nu_max``). Set to
+      ``False`` to match the original AMSGrad paper.
 
   Returns:
     The corresponding :class:`optax.GradientTransformationExtraArgs`.
@@ -1082,7 +1089,13 @@ def amsgrad(
   """
   return combine.chain(
       transform.scale_by_amsgrad(
-          b1=b1, b2=b2, eps=eps, eps_root=eps_root, mu_dtype=mu_dtype
+          b1=b1,
+          b2=b2,
+          eps=eps,
+          eps_root=eps_root,
+          mu_dtype=mu_dtype,
+          bias_correction_mu=bias_correction_mu,
+          bias_correction_nu=bias_correction_nu,
       ),
       transform.scale_by_learning_rate(learning_rate),
   )
@@ -2639,7 +2652,7 @@ def lbfgs(
   the Broyden-Fletcher-Goldfarb-Shanno (BFGS) algorithm. The BFGS algorithm
   requires storing a matrix of size :math:`p \times p` with :math:`p` the
   dimension of the parameters.
-  The limited variant circuments this issue by computing the approximation of
+  The limited variant circumvents this issue by computing the approximation of
   the inverse using only :math:`m` (``memory_size``) past differences of
   parameters/gradients. Namely, the approximation of the Hessian inverse is
   denoted :math:`P_k = P_{k, k}`, where
