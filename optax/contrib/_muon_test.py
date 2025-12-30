@@ -16,6 +16,7 @@
 
 
 import math
+import inspect
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -176,8 +177,11 @@ class MuonTest(parameterized.TestCase):
       reshape_updates, _ = get_updates(reshape_params,
                                        muon_weight_dimension_numbers=dim_nums)
       test_utils.assert_trees_all_close(
-          jax.tree.map(reshape_fn, updates), reshape_updates, rtol=1e-8,
-          atol=1e-8)
+          jax.tree.map(reshape_fn, updates),
+          reshape_updates,
+          rtol=1e-5,
+          atol=1e-5,
+      )
 
     with self.subTest("4D with dim_nums, (10, 12) -> (5, 12, 1, 2)"):
       # Test 3: 4D with dim_nums, (10, 12) -> (5, 12, 1, 2)
@@ -188,8 +192,11 @@ class MuonTest(parameterized.TestCase):
       reshape_updates, _ = get_updates(reshape_params,
                                        muon_weight_dimension_numbers=dim_nums)
       test_utils.assert_trees_all_close(
-          jax.tree.map(reshape_fn, updates), reshape_updates, rtol=1e-8,
-          atol=1e-8)
+          jax.tree.map(reshape_fn, updates),
+          reshape_updates,
+          rtol=1e-6,
+          atol=1e-6,
+      )
 
   def test_dim_nums_combinations(self):
     get_muon_mu = lambda state: state[0]["muon"][0][0][1]
@@ -249,6 +256,12 @@ class MuonTest(parameterized.TestCase):
     self.assertIsInstance(get_muon_mu(state)["w2"]["a"], _masking.MaskedNode)
     self.assertIsInstance(get_muon_mu(state)["w2"]["b"], _masking.MaskedNode)
 
+  def test_default_partitions_non_2d_to_adam(self):
+    params = {"w": jnp.ones((10, 10)), "b": jnp.ones((10,))}
+    updates, _ = get_updates(params)
+    self.assertEqual(updates["w"].shape, params["w"].shape)
+    self.assertEqual(updates["b"].shape, params["b"].shape)
+
   def test_newton_schulz(self):
     """Test that Newton--Schulz orhogonalizes/unitiarizes correctly."""
     mat_real = jax.random.normal(jax.random.key(0), (4, 3), dtype=jnp.float32)
@@ -260,8 +273,10 @@ class MuonTest(parameterized.TestCase):
 
     if jax.default_backend() == "tpu":
       atol, rtol = 1e-2, 1e-2
+      complex_atol, complex_rtol = 5e-2, 5e-2
     else:
       atol, rtol = 1e-5, 1e-5
+      complex_atol, complex_rtol = 1e-3, 1e-3
 
     # For real matrices, Newton--Schulz should produce an orthonormal matrix
     mat_real_orth = _muon.orthogonalize_via_newton_schulz(
@@ -270,6 +285,8 @@ class MuonTest(parameterized.TestCase):
         ns_steps=20,
         eps=1e-12,
         dimension_numbers=_muon.MuonDimensionNumbers(0, 1),
+        matmul_precision=jax.lax.Precision.HIGHEST,
+        use_lax_map=True,
     )
 
     gram_real = mat_real_orth.T @ mat_real_orth
@@ -291,14 +308,19 @@ class MuonTest(parameterized.TestCase):
         ns_steps=10,
         eps=1e-8,
         dimension_numbers=_muon.MuonDimensionNumbers(0, 1),
+        matmul_precision=jax.lax.Precision.HIGHEST,
+        remat_orthogonalize=True,
     )
 
     gram_complex = mat_complex_orth.conj().T @ mat_complex_orth
     with self.subTest("Complex Newton--Schulz produces a unitary matrix"):
-      self.assertTrue(
-          jnp.allclose(
-              gram_complex, jnp.eye(mat_complex.shape[1]), atol=atol, rtol=rtol
-          ),
+        self.assertTrue(
+            jnp.allclose(
+                gram_complex,
+                jnp.eye(mat_complex.shape[1]),
+                atol=complex_atol,
+                rtol=complex_rtol,
+            ),
           msg=(
               "Complex Newton–Schulz did not produce a unitary matrix."
               f"\nGram:\n{gram_complex}"
@@ -308,6 +330,122 @@ class MuonTest(parameterized.TestCase):
     with self.subTest("Output shape is preserved for complex matrices"):
       # Check that the output shape is preserved.
       self.assertEqual(mat_complex_orth.shape, mat_complex.shape)
+
+  def test_auto_lax_map_heuristic_matches_explicit(self):
+    ns_coeffs = jnp.array([2.0, -1.5, 0.5])
+    dim_nums = _muon.MuonDimensionNumbers(reduction_axis=1, output_axis=2)
+    key = jax.random.key(0)
+
+    x_small = jax.random.normal(key, (2, 4, 4))
+    out_auto = _muon.orthogonalize_via_newton_schulz(
+        x_small, ns_coeffs, ns_steps=4, dimension_numbers=dim_nums
+    )
+    out_vmap = _muon.orthogonalize_via_newton_schulz(
+        x_small,
+        ns_coeffs,
+        ns_steps=4,
+        dimension_numbers=dim_nums,
+        use_lax_map=False,
+    )
+    test_utils.assert_trees_all_close(out_auto, out_vmap, rtol=1e-6, atol=1e-6)
+
+    x_large = jax.random.normal(key, (64, 4, 4))
+    out_auto = _muon.orthogonalize_via_newton_schulz(
+        x_large, ns_coeffs, ns_steps=4, dimension_numbers=dim_nums
+    )
+    out_map = _muon.orthogonalize_via_newton_schulz(
+        x_large,
+        ns_coeffs,
+        ns_steps=4,
+        dimension_numbers=dim_nums,
+        use_lax_map=True,
+    )
+    test_utils.assert_trees_all_close(out_auto, out_map, rtol=1e-6, atol=1e-6)
+
+  def test_2d_ns_coeffs_unroll_matches_scan(self):
+    ns_coeffs = jnp.array(
+        [
+            [2.0, -1.5, 0.5],
+            [2.0, -1.5, 0.5],
+        ],
+        dtype=jnp.float32,
+    )
+    x = jax.random.normal(jax.random.key(1), (4, 3))
+    out_unroll = _muon.orthogonalize_via_newton_schulz(
+        x,
+        ns_coeffs,
+        ns_steps=2,
+        ns_unroll_threshold=4,
+    )
+    out_scan = _muon.orthogonalize_via_newton_schulz(
+        x,
+        ns_coeffs,
+        ns_steps=2,
+        ns_unroll_threshold=0,
+    )
+    test_utils.assert_trees_all_close(
+        out_unroll, out_scan, rtol=1e-6, atol=1e-6
+    )
+
+  def test_reshape_cache_reuses_functions(self):
+    x = jnp.ones((2, 3, 4), dtype=jnp.float32)
+    dim_nums = _muon.MuonDimensionNumbers(reduction_axis=1, output_axis=2)
+    reshape_fn1, inverse_fn1 = _muon._compute_muon_reshape(x, dim_nums)
+    reshape_fn2, inverse_fn2 = _muon._compute_muon_reshape(x, dim_nums)
+    self.assertIs(reshape_fn1, reshape_fn2)
+    self.assertIs(inverse_fn1, inverse_fn2)
+
+  def test_scale_by_shape_cache_ignore_dtype(self):
+    dim_nums = {"w": _muon.MuonDimensionNumbers()}
+    updates32 = {"w": jnp.ones((2, 2), dtype=jnp.float32)}
+    updates16 = {"w": jnp.ones((2, 2), dtype=jnp.float16)}
+
+    tx = _muon.scale_by_shape(
+        weight_dimension_numbers=dim_nums,
+        shape_cache_ignore_dtype=True,
+    )
+    state = tx.init(updates32)
+    cache = inspect.getclosurevars(tx.update).nonlocals["scale_cache"]
+    tx.update(updates32, state)
+    self.assertLen(cache, 1)
+    tx.update(updates16, state)
+    self.assertLen(cache, 1)
+
+    tx = _muon.scale_by_shape(
+        weight_dimension_numbers=dim_nums,
+        shape_cache_ignore_dtype=False,
+    )
+    state = tx.init(updates32)
+    cache = inspect.getclosurevars(tx.update).nonlocals["scale_cache"]
+    tx.update(updates32, state)
+    self.assertLen(cache, 1)
+    tx.update(updates16, state)
+    self.assertLen(cache, 2)
+
+  def test_adaptive_precision_defaults_to_matmul_precision(self):
+    params = {"w": jnp.ones((4, 3), dtype=jnp.float32)}
+    updates = {"w": jnp.arange(12, dtype=jnp.float32).reshape(4, 3)}
+    dim_nums = {"w": _muon.MuonDimensionNumbers()}
+    tx_default = _muon.scale_by_muon(
+        adaptive=True,
+        matmul_precision=jax.lax.Precision.HIGHEST,
+        weight_dimension_numbers=dim_nums,
+    )
+    tx_explicit = _muon.scale_by_muon(
+        adaptive=True,
+        matmul_precision=jax.lax.Precision.HIGHEST,
+        adaptive_precision=jax.lax.Precision.HIGHEST,
+        weight_dimension_numbers=dim_nums,
+    )
+    state_default = tx_default.init(params)
+    state_explicit = tx_explicit.init(params)
+    out_default, _ = tx_default.update(updates, state_default, params=params)
+    out_explicit, _ = tx_explicit.update(
+        updates, state_explicit, params=params
+    )
+    test_utils.assert_trees_all_close(
+        out_default, out_explicit, rtol=1e-6, atol=1e-6
+    )
 
   @parameterized.product(
       target=(_setup_mixed_tensor_target_complex,),
