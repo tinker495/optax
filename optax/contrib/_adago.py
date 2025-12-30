@@ -33,6 +33,7 @@ from optax._src import utils
 from optax.contrib import _muon
 from optax.transforms import _masking
 import optax.tree
+from optax.contrib import add_cautious_weight_decay
 
 WeightDimNumOrFn = _muon.WeightDimNumOrFn
 
@@ -264,6 +265,7 @@ def adago(
     weight_decay_mask: Optional[
         Union[Any, Callable[[base.Params], Any]]
     ] = None,
+    cautious_weight_decay: bool = False,
     mu_dtype: Optional[jax.typing.DTypeLike] = None,
     *,
     nesterov: bool = False,
@@ -365,7 +367,13 @@ def adago(
                   weight_dimension_numbers=adago_weight_dim_nums_fn,
                   consistent_rms=consistent_rms,
               ),
-              transform.add_decayed_weights(weight_decay, weight_decay_mask),
+              (
+                  add_cautious_weight_decay(weight_decay, weight_decay_mask)
+                  if cautious_weight_decay
+                  else transform.add_decayed_weights(
+                      weight_decay, weight_decay_mask
+                  )
+              ),
               transform.scale_by_learning_rate(learning_rate),
           ),
           'adam': alias.adamw(
@@ -375,6 +383,7 @@ def adago(
               eps=orthogonalization_eps,
               eps_root=adam_eps_root,
               weight_decay=adam_weight_decay,
+              cautious_weight_decay=cautious_weight_decay,
               mu_dtype=mu_dtype,
               nesterov=nesterov,
           ),
