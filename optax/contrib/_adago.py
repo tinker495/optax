@@ -33,7 +33,7 @@ from optax._src import utils
 from optax.contrib import _muon
 from optax.transforms import _masking
 import optax.tree
-from optax.contrib import add_cautious_weight_decay
+from optax.contrib._cwd import add_cautious_weight_decay
 
 WeightDimNumOrFn = _muon.WeightDimNumOrFn
 
