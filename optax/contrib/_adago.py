@@ -31,6 +31,7 @@ from optax._src import numerics
 from optax._src import transform
 from optax._src import utils
 from optax.contrib import _muon
+from optax.contrib import _normuon
 from optax.transforms import _masking
 import optax.tree
 from optax.contrib._cwd import add_cautious_weight_decay
@@ -48,6 +49,12 @@ class AdaGOState(NamedTuple):
   mu: base.Updates
   v_sq: base.Updates
   ns_coeffs: jax.typing.ArrayLike  # shape=(3,) or (n, 3).
+  normuon_v: base.Updates | None
+
+
+class _NormuonUpdateAndV(NamedTuple):
+  update: jax.Array
+  v: jax.Array
 
 
 def scale_by_adago(
@@ -66,6 +73,11 @@ def scale_by_adago(
     mu_dtype: Optional[jax.typing.DTypeLike] = None,
     *,
     nesterov: bool = False,
+    use_normuon: bool = False,
+    normuon_b2: jax.typing.ArrayLike = 0.95,
+    normuon_eps: jax.typing.ArrayLike = 1e-8,
+    normuon_rms_scale: jax.typing.ArrayLike = 0.2,
+    normuon_v_dtype: Optional[jax.typing.DTypeLike] = None,
     weight_dimension_numbers: WeightDimNumOrFn | None = None,
     consistent_rms: jax.typing.ArrayLike | None = None,
 ) -> base.GradientTransformation:
@@ -88,8 +100,14 @@ def scale_by_adago(
     initial_accumulator_value: Initial value v0 for the accumulator.
     mu_dtype: Data type of the momentum accumulator.
     nesterov: Whether to use Nesterov momentum.
+    use_normuon: Whether to use NorMuon-style neuron-wise normalization.
+    normuon_b2: Decay rate for the NorMuon second moment accumulator.
+    normuon_eps: Term added inside square roots for NorMuon normalization.
+    normuon_rms_scale: Target RMS for NorMuon-normalized updates.
+    normuon_v_dtype: Data type for NorMuon second moment accumulator.
     weight_dimension_numbers: Optional tree or callable defining reshape specs.
     consistent_rms: Optional float to activate consistent RMS scaling.
+      Ignored when `use_normuon=True`.
 
   Returns:
     A `GradientTransformation` object.
@@ -99,6 +117,23 @@ def scale_by_adago(
     Updates <https://arxiv.org/pdf/2509.02981>`_, 2025
   """
   mu_dtype = utils.canonicalize_dtype(mu_dtype)
+  normuon_v_dtype = utils.canonicalize_dtype(
+      jnp.float32 if normuon_v_dtype is None else normuon_v_dtype
+  )
+
+  def _resolve_dim_nums(tree):
+    if callable(weight_dimension_numbers):
+      resolved = weight_dimension_numbers(tree)
+    else:
+      resolved = weight_dimension_numbers
+    if resolved is None or _is_weight_dim_nums(resolved):
+      dim_nums = _muon.MuonDimensionNumbers() if resolved is None else resolved
+      return jax.tree.map(
+          lambda g: dim_nums if g is not None else None,
+          tree,
+          is_leaf=lambda x: x is None,
+      )
+    return resolved
 
   def init_fn(params):
     mu = optax.tree.zeros_like(params, dtype=mu_dtype)
@@ -113,34 +148,40 @@ def scale_by_adago(
       raise ValueError(
           f'ns_coeffs must have shape (3,) or (n, 3), got {ns_coeffs_.shape}'
       )
+    normuon_v = None
+    if use_normuon:
+      resolved_dim_nums = _resolve_dim_nums(params)
+
+      def _init_v_leaf(
+          p: jax.Array, dim_num: _muon.MuonDimensionNumbers | None
+      ):
+        if dim_num is None:
+          if p.ndim != 2:
+            raise ValueError(
+                'NorMuon requires `weight_dimension_numbers` for non-2D tensors'
+                f', got rank={p.ndim} and {dim_num=}.'
+            )
+          dim_num = _muon.MuonDimensionNumbers()
+        batch_size, output_size = _normuon._v_shape(p, dim_num)  # pylint: disable=protected-access
+        return jnp.zeros((batch_size, output_size), dtype=normuon_v_dtype)
+
+      normuon_v = jax.tree.map(
+          _init_v_leaf,
+          params,
+          resolved_dim_nums,
+          is_leaf=_is_weight_dim_nums,
+      )
     return AdaGOState(
         count=jnp.zeros([], jnp.int32),
         mu=mu,
         v_sq=v_sq,
         ns_coeffs=ns_coeffs_,
+        normuon_v=normuon_v,
     )
 
   def update_fn(updates, state, params=None):
     grads = updates
-    if callable(weight_dimension_numbers):
-      # Populate weight_dim_nums if it's a callable. Use updates instead of
-      # actual params since only shapes matter and params may not be provided.
-      resolved_weight_dim_nums = weight_dimension_numbers(updates)
-    elif weight_dimension_numbers is None or _is_weight_dim_nums(
-        weight_dimension_numbers
-    ):
-      dim_nums = (
-          _muon.MuonDimensionNumbers()
-          if weight_dimension_numbers is None
-          else weight_dimension_numbers
-      )
-      resolved_weight_dim_nums = jax.tree.map(
-          lambda g: dim_nums if g is not None else None,
-          updates,
-          is_leaf=lambda x: x is None,
-      )
-    else:
-      resolved_weight_dim_nums = weight_dimension_numbers
+    resolved_weight_dim_nums = _resolve_dim_nums(updates)
 
     def _leaf_norm(g):
       if g is None:
@@ -179,25 +220,66 @@ def scale_by_adago(
         resolved_weight_dim_nums,
         is_leaf=lambda x: x is None or _is_weight_dim_nums(x),
     )
+    normuon_v = state.normuon_v
+    if use_normuon:
+      def _normalize_leaf(
+          o: jax.Array,
+          v: jax.Array,
+          dim_num: _muon.MuonDimensionNumbers | None,
+      ):
+        if dim_num is None:
+          if o.ndim != 2:
+            raise ValueError(
+                'NorMuon requires `weight_dimension_numbers` for non-2D tensors'
+                f', got rank={o.ndim} and {dim_num=}.'
+            )
+          dim_num = _muon.MuonDimensionNumbers()
 
-    if consistent_rms is not None:
-      scaling_fn = functools.partial(
-          _muon._scale_update_for_consistent_rms, consistent_rms=consistent_rms
+        reshape_fn, inverse_fn = _muon._compute_muon_reshape(o, dim_num)  # pylint: disable=protected-access
+        o_flat = reshape_fn(o)
+        mean_sq = jnp.mean(jnp.square(o_flat), axis=1)
+        v_new = normuon_b2 * v + (1.0 - normuon_b2) * mean_sq
+        denom = jnp.sqrt(v_new[:, None, :] + normuon_eps)
+        o_norm = o_flat / denom
+        rms = jnp.sqrt(jnp.mean(jnp.square(o_norm), axis=(1, 2)))
+        scale = normuon_rms_scale / (rms + normuon_eps)
+        o_scaled = o_norm * scale[:, None, None]
+        return _NormuonUpdateAndV(inverse_fn(o_scaled), v_new)
+
+      updates_and_v = jax.tree.map(
+          _normalize_leaf,
+          updates,
+          normuon_v,
+          resolved_weight_dim_nums,
+          is_leaf=_is_weight_dim_nums,
+      )
+      _is_update_and_v = lambda x: isinstance(x, _NormuonUpdateAndV)
+      updates = jax.tree.map(
+          lambda uv: uv.update, updates_and_v, is_leaf=_is_update_and_v
+      )
+      normuon_v = jax.tree.map(
+          lambda uv: uv.v, updates_and_v, is_leaf=_is_update_and_v
       )
     else:
-      scaling_fn = _muon._scale_update_for_width_transfer
+      if consistent_rms is not None:
+        scaling_fn = functools.partial(
+            _muon._scale_update_for_consistent_rms,
+            consistent_rms=consistent_rms,
+        )
+      else:
+        scaling_fn = _muon._scale_update_for_width_transfer
 
-    def _scale_update(update, dim_num):
-      if update is None:
-        return None
-      return scaling_fn(update, dim_num)
+      def _scale_update(update, dim_num):
+        if update is None:
+          return None
+        return scaling_fn(update, dim_num)
 
-    updates = jax.tree.map(
-        _scale_update,
-        updates,
-        resolved_weight_dim_nums,
-        is_leaf=lambda x: x is None or _is_weight_dim_nums(x),
-    )
+      updates = jax.tree.map(
+          _scale_update,
+          updates,
+          resolved_weight_dim_nums,
+          is_leaf=lambda x: x is None or _is_weight_dim_nums(x),
+      )
     lr_t = (
         learning_rate(state.count)
         if callable(learning_rate)
@@ -239,11 +321,14 @@ def scale_by_adago(
     updates = jax.tree.map(_apply_step, updates, step_sizes)
 
     mu = optax.tree.cast(mu, mu_dtype)
+    if normuon_v is not None:
+      normuon_v = optax.tree.cast(normuon_v, normuon_v_dtype)
     return updates, AdaGOState(
         count=count_inc,
         mu=mu,
         v_sq=new_v_sq,
         ns_coeffs=state.ns_coeffs,
+        normuon_v=normuon_v,
     )
   return base.GradientTransformation(init_fn, update_fn)
 
@@ -269,6 +354,11 @@ def adago(
     mu_dtype: Optional[jax.typing.DTypeLike] = None,
     *,
     nesterov: bool = False,
+    use_normuon: bool = False,
+    normuon_b2: jax.typing.ArrayLike = 0.95,
+    normuon_eps: jax.typing.ArrayLike = 1e-8,
+    normuon_rms_scale: jax.typing.ArrayLike = 0.2,
+    normuon_v_dtype: Optional[jax.typing.DTypeLike] = None,
     adam_b1: jax.typing.ArrayLike = 0.9,
     adam_b2: jax.typing.ArrayLike = 0.999,
     adam_eps_root: jax.typing.ArrayLike = 0.0,
@@ -276,11 +366,13 @@ def adago(
     adago_weight_dimension_numbers: WeightDimNumOrFn | None = None,
     consistent_rms: jax.typing.ArrayLike | None = None,
 ) -> base.GradientTransformation:
-  r"""AdaGO optimizer with Muon-style orthogonalization.
+  r"""AdaGO optimizer with Muon/NorMuon-style orthogonalization.
 
   AdaGO applies orthogonalized momentum updates to matrix parameters and uses
-  an AdaGrad-Norm style stepsize with clipping and a minimum step size. Non-2D
-  parameters are optimized with AdamW, mirroring the Muon setup.
+  an AdaGrad-Norm style stepsize with clipping and a minimum step size. When
+  `use_normuon=True`, the orthogonalized updates are normalized using
+  NorMuon-style neuron-wise second moments. Non-2D parameters are optimized
+  with AdamW, mirroring the Muon setup.
 
   Args:
     learning_rate: Global learning rate or schedule for AdaGO and AdamW.
@@ -296,6 +388,11 @@ def adago(
     weight_decay_mask: Mask for weight decay.
     mu_dtype: Data type of the momentum accumulator.
     nesterov: Whether to use Nesterov momentum.
+    use_normuon: Whether to use NorMuon-style neuron-wise normalization.
+    normuon_b2: Decay rate for the NorMuon second moment accumulator.
+    normuon_eps: Term added inside square roots for NorMuon normalization.
+    normuon_rms_scale: Target RMS for NorMuon-normalized updates.
+    normuon_v_dtype: Data type for NorMuon second moment accumulator.
     adam_b1: Exponential decay rate for Adam's first moment estimates.
     adam_b2: Exponential decay rate for Adam's second moment estimates.
     adam_eps_root: Epsilon to stabilize division in Adam, square root version.
@@ -308,7 +405,8 @@ def adago(
       possibly masked pytree of specs, similar to `weight_decay_mask`. If not
       provided, AdaGO is applied to all 2D parameters.
     consistent_rms: Optional float to activate consistent RMS scaling.
-      If `None`, uses width scaling `sqrt(max(1, fan_out / fan_in))`.
+      If `None`, uses width scaling `sqrt(max(1, fan_out / fan_in))`. This is
+      ignored when `use_normuon=True`.
 
   Returns:
     The corresponding `GradientTransformation`.
@@ -364,6 +462,11 @@ def adago(
                   initial_accumulator_value=initial_accumulator_value,
                   mu_dtype=mu_dtype,
                   nesterov=nesterov,
+                  use_normuon=use_normuon,
+                  normuon_b2=normuon_b2,
+                  normuon_eps=normuon_eps,
+                  normuon_rms_scale=normuon_rms_scale,
+                  normuon_v_dtype=normuon_v_dtype,
                   weight_dimension_numbers=adago_weight_dim_nums_fn,
                   consistent_rms=consistent_rms,
               ),

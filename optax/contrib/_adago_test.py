@@ -56,6 +56,23 @@ class AdaGOTest(absltest.TestCase):
     self.assertIsInstance(adam_state[0].mu["w"], _masking.MaskedNode)
     test_utils.assert_tree_all_finite(updates)
 
+  def test_normuon_path_updates_v(self):
+    params = {"w": jnp.ones((2, 3), dtype=jnp.float32)}
+    grads = {"w": jnp.ones((2, 3), dtype=jnp.float32)}
+
+    tx = _adago.scale_by_adago(
+        learning_rate=0.1,
+        use_normuon=True,
+        normuon_b2=0.5,
+        normuon_rms_scale=1.0,
+    )
+    state = tx.init(params)
+    updates, new_state = tx.update(grads, state, params)
+
+    self.assertIsNotNone(new_state.normuon_v)
+    self.assertEqual(new_state.normuon_v["w"].shape, (1, 3))
+    test_utils.assert_tree_all_finite(updates)
+
 
 if __name__ == "__main__":
   absltest.main()
