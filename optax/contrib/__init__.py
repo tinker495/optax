@@ -59,6 +59,9 @@ from optax.contrib._privacy import DifferentiallyPrivateAggregateState
 from optax.contrib._privacy import dpsgd
 from optax.contrib._prodigy import prodigy
 from optax.contrib._prodigy import ProdigyState
+from optax.contrib._prism import prism
+from optax.contrib._prism import PrismState
+from optax.contrib._prism import scale_by_prism
 from optax.contrib._reduce_on_plateau import reduce_on_plateau
 from optax.contrib._reduce_on_plateau import ReduceLROnPlateauState
 from optax.contrib._sam import normalize
